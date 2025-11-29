@@ -6,7 +6,8 @@ class BatterySim:
                  step_size_minutes=15, 
                  plant_capacity=10.0, #MWh
                  plant_capex=300000.0, #$/MWh
-                 eol_soh=0.80):
+                 eol_soh=0.80,
+                 soc_limits = (0.05, 0.95)):
         """
         A battery simulator that tracks physics and economic degradation.
         step_size_minutes (float): Time step size in minutes
@@ -17,6 +18,7 @@ class BatterySim:
         # 1. Economic variables
         self.dt_seconds = step_size_minutes * 60
         self.eol_soh = eol_soh
+        self.soc_limits = soc_limits
 
         # 2. Physics variables
         options = {
@@ -32,18 +34,14 @@ class BatterySim:
             "Current function [A]": "[input]",
             
             # --- LITHIUM PLATING PARAMETERS ---
-            # (Required because you set "lithium plating": "irreversible")
             "Typical plated lithium concentration [mol.m-3]": 1000.0,
-            "Initial plated lithium concentration [mol.m-3]": 0.0, # <--- The specific error you just hit
+            "Initial plated lithium concentration [mol.m-3]": 0.0,
             "Exchange-current density for plating [A.m-2]": 0.001,
             "Lithium plating transfer coefficient": 0.7,
             "Dead lithium decay rate [s-1]": 0,
             "Lithium metal partial molar volume [m3.mol-1]": 1.3e-5,
             
             # --- SEI PARAMETERS ---
-            # (Required because you set "SEI": "reaction limited")
-            # Chen2020 does not have SEI chemistry defined, so we use Mohtat's values
-            # as a proxy for a standard Graphite SEI layer.
             "Initial SEI thickness [m]": 5e-9,
             "SEI kinetic rate constant [m.s-1]": 1.0e-15,
             "SEI resistivity [Ohm.m]": 2.0e5,
@@ -95,13 +93,17 @@ class BatterySim:
         self.nominal_capacity = self.param.evaluate(self.model.param.Q)
         self.current_capacity = self.nominal_capacity 
         self.prev_lithium_lost = 0.0
+        initial_voltage = self.sim.solution["Terminal voltage [V]"].entries[-1]
+        self.last_voltage = initial_voltage
         
         # EMA for degradation rate
         self.deg_rate_ema = 0.0
         self.ema_alpha = 0.05 
         self.last_voltage = 3.2
         
-        return self._get_current_state()
+        state = self._get_current_state()
+        state["physics"]["voltage"] = initial_voltage
+        return state
 
     def step(self, power_input, instant_elec_cost, avg_daily_profit):
         """
@@ -112,16 +114,27 @@ class BatterySim:
         """
         cell_power_watts = power_input * 1e6 / self.n_cells # Power per cell (W)
         v_est = max(2.0, self.last_voltage)
-        current_amps = cell_power_watts / v_est # I = P
 
 
-        # 1. Run Physics Solver
+        # Check SOC limits
+        tentative_amps = cell_power_watts / v_est # I = P
+        tentative_ah_exchanged = tentative_amps * (self.dt_seconds / 3600.0) # Current (A) * Time (h) = Capacity (Ah)
+        tentative_capacity = self.current_capacity - tentative_ah_exchanged # Update current capacity (flip signs)
+        projected_soc = tentative_capacity / self.nominal_capacity
+
+        if projected_soc < self.soc_limits[0] or projected_soc > self.soc_limits[1]:
+            current_amps = 0.0
+        else:
+            current_amps = tentative_amps
+
+
+        # Run Physics Solver
         try:
             sol = self.sim.step(dt=self.dt_seconds, inputs={"Current function [A]": current_amps}) #type: ignore
         except pybamm.SolverError:
             return None, True
 
-        # 2. Extract Physical Properties
+        # Extract Physical Properties
         lithium_lost_cumulative = sol["Total lithium lost [mol]"].entries[-1]
         voltage = sol["Terminal voltage [V]"].entries[-1]
         self.last_voltage = voltage
@@ -131,12 +144,12 @@ class BatterySim:
         irrev = np.mean(sol["Irreversible electrochemical heating [W]"].entries)
         heating_watts = ohmic + irrev
 
-        # 3. Update SoC manually
+        # Update SoC manually
         ah_exchanged = current_amps * (self.dt_seconds / 3600.0) # Current (A) * Time (h) = Capacity (Ah)
         self.current_capacity -= ah_exchanged # Update current capacity (flip signs)
         soc = np.clip(self.current_capacity / self.nominal_capacity, 0.0, 1.0)
 
-        # 4. Calculate degradation
+        # Calculate degradation
         delta_li_loss = lithium_lost_cumulative - self.prev_lithium_lost # Mols lost this step
         self.prev_lithium_lost = lithium_lost_cumulative # Update for next step
         
@@ -152,12 +165,15 @@ class BatterySim:
         # Economic Costs
         costs = self._calculate_costs(delta_li_loss, heating_watts, current_soh, instant_elec_cost, avg_daily_profit)
 
+        # Compute actual power (may be limited by SOC or voltage distortions)
+        actual_power_watts = sol["Terminal power [W]"].entries[-1]
         # 5. Package Output
         state = {
             "physics": {
                 "voltage": voltage,
                 "soc": soc, 
                 "soh": current_soh,
+                "power_actual": actual_power_watts / 1000.0, # kW
                 "temperature_c": temp_k - 273.15,
                 "lithium_lost_step": delta_li_loss
             },
@@ -203,9 +219,10 @@ class BatterySim:
     def _get_current_state(self):
         return {
             "physics": {
-                "voltage": 0,
+                "voltage": 3.7, #specified by Chen2020
                 "soc": 0.0, # Start empty
                 "soh": 1.0,
+                "power_actual": 0.0,
                 "temperature_c": 25.0,
                 "lithium_lost_step": 0.0
             },
