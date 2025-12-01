@@ -95,21 +95,21 @@ class DiscreteEnv(gym.Env):
 
         profit_guess = 0 if self.count == 0 else self.cum_reward/((self.step_size_minutes*self.count)*60*24)
         
-        self.battery_state, battery_done = self.battery.step(action_power, self.state[1]/1000, profit_guess) # HARDCODED DAILY PROFIT GUESS
+        self.battery_state, battery_done = self.battery.step(action_power * 1e6, self.state[1] / 1000, profit_guess) # HARDCODED DAILY PROFIT GUESS, convert MW to W and $/MWh to $/kWh
         
         if self.battery_state is None: # pybamm solver error 
             return [0,0], 0, True, False, self._get_info()
         
-        actual_power = self.battery_state["physics"]["power_actual"] # in kW
+        actual_power = self.battery_state["physics"]["power_actual"] # in W
 
-        gross_profit = actual_power*1000 * self.step_size_minutes/60 * (self.state[1]/1000)
+        gross_profit = actual_power * 1e-6 * self.step_size_minutes/60 * (self.state[1]/1000)
         reward = gross_profit - self.battery_state["costs"]["total"]
         self.cum_reward += reward
         
         self.count += 1
         price = self.data.iloc[self.count+self.init_index].price
         self.state = [self.battery_state["physics"]["soc"], price]
-        print(f"Step {self.count}: Action {action_power} kW, Price {price} $/MWh, Reward {reward:.2f} $, SoC {self.state[0]:.4f}")
+        print(f"Step {self.count}: Action {action_power} MW, Actual {actual_power} kW, Price {price} $/MWh, Reward {reward:.2f} $, SoC {self.state[0]:.4f}")
 
         if battery_done or (self.count >= self.modeling_period):
             done = True

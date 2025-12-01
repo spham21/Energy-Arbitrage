@@ -89,10 +89,25 @@ class BatterySim:
         self.n_li_init = self.sim.solution["Total lithium lost [mol]"].entries[-1] + \
                          self.sim.solution["Total lithium in particles [mol]"].entries[-1] #type: ignore
         
-        # Use evaluating parameters directly doesn't require a solve, but good to have
+        # Evaluating parameters directly doesn't require a solve, but good to have
         self.nominal_capacity = self.param.evaluate(self.model.param.Q)
-        self.current_capacity = self.nominal_capacity 
-        self.prev_lithium_lost = 0.0
+
+        # to initialize, discharge to 50% SOC
+        target_soc = 0.5
+        discharge_amount_ah = self.nominal_capacity * (1.0 - target_soc)
+        current_1c = self.nominal_capacity
+        time_seconds = (discharge_amount_ah / current_1c) * 3600
+        
+        # Run the discharge "pre-step" (fast, no thermal degradation)
+        # We assume this setup phase doesn't count towards agent reward/degradation
+        self.sim.step(dt=time_seconds, inputs={"Current function [A]": current_1c})
+
+
+        self.current_capacity = self.nominal_capacity * target_soc 
+        self.prev_lithium_lost = self.sim.solution["Total lithium lost [mol]"].entries[-1]
+        self.n_li_init = self.prev_lithium_lost + \
+                         self.sim.solution["Total lithium in particles [mol]"].entries[-1]
+        
         initial_voltage = self.sim.solution["Terminal voltage [V]"].entries[-1]
         self.last_voltage = initial_voltage
         
@@ -112,7 +127,7 @@ class BatterySim:
             instant_elec_cost (float): $/kWh
             avg_daily_profit (float): $/day
         """
-        cell_power_watts = power_input * 1e6 / self.n_cells # Power per cell (W)
+        cell_power_watts = power_input / self.n_cells # Power per cell (W)
         v_est = max(2.0, self.last_voltage)
 
 
@@ -173,7 +188,7 @@ class BatterySim:
                 "voltage": voltage,
                 "soc": soc, 
                 "soh": current_soh,
-                "power_actual": actual_power_watts / 1000.0, # kW
+                "power_actual": actual_power_watts,
                 "temperature_c": temp_k - 273.15,
                 "lithium_lost_step": delta_li_loss
             },
@@ -217,10 +232,15 @@ class BatterySim:
         }
 
     def _get_current_state(self):
+
+        if self.nominal_capacity and self.nominal_capacity > 0:
+            real_soc = self.current_capacity / self.nominal_capacity
+        else:
+            real_soc = 0.5 
         return {
             "physics": {
                 "voltage": 3.7, #specified by Chen2020
-                "soc": 0.0, # Start empty
+                "soc": real_soc,
                 "soh": 1.0,
                 "power_actual": 0.0,
                 "temperature_c": 25.0,
