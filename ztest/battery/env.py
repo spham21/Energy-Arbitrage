@@ -8,14 +8,14 @@ from typing import Optional
 
 import numpy as np
 import gymnasium as gym
-from battery_env import BatterySim
+from battery_env import BatterySim # type:ignore
 from datetime import datetime
 
 #import pandas as pd
 
 class DiscreteEnv(gym.Env):
 
-    def __init__(self, modeling_period: int, dataframe: str, precision_level: Optional[str] = "low" ):
+    def __init__(self, modeling_period: int, dataframe: str, verbose: Optional[bool] = True, precision_level: Optional[str] = "low" ):
         """
         :param env_name: A string that represents the name of the environment.
         :param modeling_period: An integer that represents the modeling period (in whatever increment the provided dataframe is in)
@@ -24,8 +24,8 @@ class DiscreteEnv(gym.Env):
         """
         super().__init__()
         self.action_space = gym.spaces.Discrete(3)
-        self.observation_space = gym.spaces.Box(low=np.array([0.2,-np.inf]), high=np.array([0.8,np.inf])) # No predictions used
-        
+        self.observation_space = gym.spaces.Box(low=np.array([0.2,-np.inf, -np.inf]), high=np.array([0.8,np.inf, np.inf])) # No predictions used
+        self.verbose = verbose
 
         self.env_name = "Energy grid"
         self.modeling_period = modeling_period
@@ -34,7 +34,7 @@ class DiscreteEnv(gym.Env):
         self.state = None
         self.data = dataframe.reset_index(drop=True) # Date should be in datetime format!!
         self.step_size_minutes = (self.data.iloc[1].Date-self.data.iloc[0].Date).seconds/60
-        self.battery = BatterySim(self.step_size_minutes, plant_capacity=10.0, plant_capex=300000) 
+        self.battery = BatterySim(self.step_size_minutes, plant_capacity=10.0, plant_capex=300000, verbose=verbose) 
         self.battery_state = None
         self.cum_reward = 0.05 # seed estimate
         self.init_index = None
@@ -75,13 +75,14 @@ class DiscreteEnv(gym.Env):
         """
         super().reset(seed=seed)  # Defines np's random generator
         # ADD: get state from first line
-        self.init_index = round(np.random.uniform(0, len(self.data)-self.modeling_period-1))
+        self.init_index = round(np.random.uniform(0, len(self.data)-self.modeling_period-3))
         self.count = 0
 
         self.battery_state = self.battery._get_current_state()
         soc = self.battery_state["physics"]["soc"]
-
-        self.state = [soc, self.data.iloc[self.count+self.init_index].price]
+        real_price = self.data.iloc[self.count+self.init_index].price
+        forecast_3h = self.data.iloc[self.count+3+self.init_index].pred_3h
+        self.state = [soc, real_price, forecast_3h]
 
         return self.state, self._get_info()
         
@@ -90,23 +91,33 @@ class DiscreteEnv(gym.Env):
         #self._action_checker(action)
         done = False
 
-        action_list = [-1, 0, 1] # in MW        
-        power = action_list[action]
+        action_list = [-2.5, 0, 2,5] # in MW        
+        action_power = action_list[action]
 
         profit_guess = 0 if self.count == 0 else self.cum_reward/((self.step_size_minutes*self.count)*60*24)
         
-        self.battery_state, battery_done = self.battery.step(power, self.state[1]/1000, profit_guess) # HARDCODED DAILY PROFIT GUESS
+        self.battery_state, battery_done = self.battery.step(action_power * 1e6, self.state[1] / 1000, profit_guess) # HARDCODED DAILY PROFIT GUESS, convert MW to W and $/MWh to $/kWh
         
         if self.battery_state is None: # pybamm solver error 
             return [0,0], 0, True, False, self._get_info()
         
-        gross_profit = power*1000 * self.step_size_minutes/60 * (self.state[1]/1000)
+        actual_power = self.battery_state["physics"]["power_actual"] * 1e-6 # in MW
+
+        gross_profit = actual_power * self.step_size_minutes/60 * (self.state[1]) 
         reward = gross_profit - self.battery_state["costs"]["total"]
         self.cum_reward += reward
         
+        if self.battery_state["penalty"]:
+          reward -= 10
+
         self.count += 1
-        price = self.data.iloc[self.count+self.init_index].price
-        self.state = [self.battery_state["physics"]["soc"], price]
+        real_price = self.data.iloc[self.count+self.init_index].price
+        forecast_3h = self.data.iloc[self.count+3+self.init_index].pred_3h
+
+        self.state = [self.battery_state["physics"]["soc"], real_price, forecast_3h]
+        if self.verbose:
+          print(f"Step {self.count}: Action {action_power} MW, Actual {actual_power} MW, Price {real_price} $/MWh, Reward {reward:.2f} $, SoC {self.state[0]:.4f}")
+          print(f"costs: {self.battery_state['costs']}, cum_reward: {self.cum_reward:.2f} $, soh: {self.battery_state['physics']['soh']:.4f}")
 
         if battery_done or (self.count >= self.modeling_period):
             done = True
