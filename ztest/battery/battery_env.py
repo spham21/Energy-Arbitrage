@@ -7,14 +7,15 @@ class BatterySim:
                  plant_capacity=10.0, #MWh
                  plant_capex=300000.0, #$/MWh
                  eol_soh=0.80,
-                 soc_limits = (0.05, 0.95)):
+                 soc_limits = (0.05, 0.95),
+                 verbose=True):
         """
         A battery simulator that tracks physics and economic degradation.
         step_size_minutes (float): Time step size in minutes
         battery_capex (float): Initial cost of battery ($)
         eol_soh (float): State of health at which we terminate battery (buy new one)
         """
-        
+        self.verbose=verbose
         # 1. Economic variables
         self.dt_seconds = step_size_minutes * 60
         self.eol_soh = eol_soh
@@ -154,8 +155,10 @@ class BatterySim:
 
         if projected_soc < self.soc_limits[0] or projected_soc > self.soc_limits[1]:
             current_amps = 0.0
+            penalty=True
         else:
             current_amps = tentative_amps
+            penalty=False
 
 
         # Run Physics Solver
@@ -163,8 +166,8 @@ class BatterySim:
             sol = self.sim.step(dt=self.dt_seconds, inputs={"Current function [A]": current_amps}) #type: ignore
         except pybamm.SolverError:
             return None, True
-        
-        print("current_amps:", current_amps)
+        if self.verbose:
+            print("current_amps:", current_amps)
 
         # Extract Physical Properties
         lithium_lost_cumulative = sol["Total lithium lost [mol]"].entries[-1]
@@ -210,7 +213,8 @@ class BatterySim:
                 "temperature_c": temp_k - 273.15,
                 "lithium_lost_step": delta_li_loss
             },
-            "costs": costs
+            "costs": costs,
+            "penalty": penalty
         }
 
         # Check for End of Life
