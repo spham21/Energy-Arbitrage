@@ -92,10 +92,25 @@ class BatterySim:
         # Evaluating parameters directly doesn't require a solve, but good to have
         self.nominal_capacity = self.param.evaluate(self.model.param.Q)
 
+        # 2. BURN-IN PHASE (Stabilize Chemistry)
+        # Cycle the battery 5 times (1C discharge -> 1C charge)
+        # This grows the initial SEI layer so the Agent doesn't see the "new battery" spike.
+        current_1c = self.nominal_capacity
+        cycle_duration = 1800  # 1 hour per leg
+        
+        print("Running burn-in cycles...", end=" ")
+        for _ in range(5):
+            # Discharge 1 hr
+            self.sim.step(dt=cycle_duration, inputs={"Current function [A]": current_1c})
+            # Charge 1 hr
+            self.sim.step(dt=cycle_duration, inputs={"Current function [A]": -current_1c})
+        print("Done.")
+
+
         # to initialize, discharge to 50% SOC
         target_soc = 0.5
         discharge_amount_ah = self.nominal_capacity * (1.0 - target_soc)
-        current_1c = self.nominal_capacity
+
         time_seconds = (discharge_amount_ah / current_1c) * 3600
         
         # Run the discharge "pre-step" (fast, no thermal degradation)
@@ -114,9 +129,9 @@ class BatterySim:
         # EMA for degradation rate
         self.deg_rate_ema = 0.0
         self.ema_alpha = 0.05 
-        self.last_voltage = 3.2
         
         state = self._get_current_state()
+        print(state)
         state["physics"]["voltage"] = initial_voltage
         return state
 
@@ -148,6 +163,8 @@ class BatterySim:
             sol = self.sim.step(dt=self.dt_seconds, inputs={"Current function [A]": current_amps}) #type: ignore
         except pybamm.SolverError:
             return None, True
+        
+        print("current_amps:", current_amps)
 
         # Extract Physical Properties
         lithium_lost_cumulative = sol["Total lithium lost [mol]"].entries[-1]
@@ -158,6 +175,9 @@ class BatterySim:
         ohmic = np.mean(sol["Ohmic heating [W]"].entries)
         irrev = np.mean(sol["Irreversible electrochemical heating [W]"].entries)
         heating_watts = ohmic + irrev
+
+        actual_cell_watts = voltage * current_amps
+        actual_plant_watts = actual_cell_watts * self.n_cells
 
         # Update SoC manually
         ah_exchanged = current_amps * (self.dt_seconds / 3600.0) # Current (A) * Time (h) = Capacity (Ah)
@@ -179,16 +199,14 @@ class BatterySim:
 
         # Economic Costs
         costs = self._calculate_costs(delta_li_loss, heating_watts, current_soh, instant_elec_cost, avg_daily_profit)
-
-        # Compute actual power (may be limited by SOC or voltage distortions)
-        actual_power_watts = sol["Terminal power [W]"].entries[-1]
+        
         # 5. Package Output
         state = {
             "physics": {
                 "voltage": voltage,
                 "soc": soc, 
                 "soh": current_soh,
-                "power_actual": actual_power_watts,
+                "power_actual": actual_plant_watts,
                 "temperature_c": temp_k - 273.15,
                 "lithium_lost_step": delta_li_loss
             },
@@ -200,7 +218,12 @@ class BatterySim:
         
         return state, done
 
-    def _calculate_costs(self, delta_li_loss, heating_watts, current_soh, instant_elec_cost, avg_daily_profit):
+    def _calculate_costs(self, 
+                        delta_li_loss, # Mols
+                        heating_watts, # W
+                        current_soh, # fraction
+                        instant_elec_cost, # $/MWh
+                        avg_daily_profit):
         """Internal helper to compute the three cost components."""
         
         # 1. Hardware Wear Cost (Capital Depreciation)
@@ -208,10 +231,13 @@ class BatterySim:
         fraction_life_consumed = delta_li_loss / allowable_li_loss # Frac of total allowable_li_loss, lost in this step?
         cost_wear = fraction_life_consumed * self.capex_per_cell * self.n_cells # Estimate of wear cost this step
 
+        # DEBUGGING:
+        cost_wear /= 100.0
+
         # 2. Inefficiency Heat Cost
         heat_joules = heating_watts * self.dt_seconds  # Energy = Power * Time
-        heat_kwh = heat_joules / 3.6e6 # Convert J to kWh
-        cost_heat = heat_kwh * instant_elec_cost * self.n_cells # Scale up to all cells in plant
+        heat_mwh = heat_joules / 3.6e9 # Convert J to MWh
+        cost_heat = heat_mwh * instant_elec_cost * self.n_cells # Scale up to all cells in plant
 
         # 3. Revenue Compression (Opportunity Cost of Wear)
         val_per_mol_daily = avg_daily_profit / self.n_li_init # How much does 1 mol of lithium earn us per day? ($/mol/day)

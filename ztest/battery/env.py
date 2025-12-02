@@ -100,16 +100,17 @@ class DiscreteEnv(gym.Env):
         if self.battery_state is None: # pybamm solver error 
             return [0,0], 0, True, False, self._get_info()
         
-        actual_power = self.battery_state["physics"]["power_actual"] # in W
+        actual_power = self.battery_state["physics"]["power_actual"] * 1e-6 # in MW
 
-        gross_profit = actual_power * 1e-6 * self.step_size_minutes/60 * (self.state[1]/1000)
+        gross_profit = actual_power * self.step_size_minutes/60 * (self.state[1]) 
         reward = gross_profit - self.battery_state["costs"]["total"]
         self.cum_reward += reward
         
         self.count += 1
         price = self.data.iloc[self.count+self.init_index].price
         self.state = [self.battery_state["physics"]["soc"], price]
-        print(f"Step {self.count}: Action {action_power} MW, Actual {actual_power} kW, Price {price} $/MWh, Reward {reward:.2f} $, SoC {self.state[0]:.4f}")
+        print(f"Step {self.count}: Action {action_power} MW, Actual {actual_power} MW, Price {price} $/MWh, Reward {reward:.2f} $, SoC {self.state[0]:.4f}")
+        print(f"costs: {self.battery_state['costs']}, cum_reward: {self.cum_reward:.2f} $, soh: {self.battery_state['physics']['soh']:.4f}")
 
         if battery_done or (self.count >= self.modeling_period):
             done = True
